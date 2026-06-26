@@ -1,0 +1,41 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  User
+  Admin
+}
+
+model User {
+  id            String         @id @db.Uuid // Cognito "sub"
+  email         String         @unique
+  name          String
+  role          Role           @default(User)
+  created_at    DateTime       @default(now())
+  
+  awsConnection AwsConnection?
+
+  @@map("users")
+}
+
+model AwsConnection {
+  id              String   @id @default(uuid()) @db.Uuid
+  user_id         String   @unique @db.Uuid
+  user            User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  role_arn        String
+  secret_arn      String
+  aurora_endpoint String
+  region          String
+  account_id      String
+  database_name   String   @default("backuppilot")
+  stack_name      String
+  created_at      DateTime @default(now())
+
+  @@map("aws_connections")
+}

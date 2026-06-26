@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'BackupPilot Customer Infrastructure - Deploys Aurora, Lambdas, and IAM Roles'
+
+Parameters:
+  BackupPilotAccountId:
+    Type: String
+    Description: 'The AWS Account ID of BackupPilot to allow AssumeRole'
+    Default: '123456789012' # Placeholder
+
+Resources:
+  # ---------------------------------------------------------
+  # NETWORKING (VPC, Subnets, DB Subnet Group, Security Group)
+  # ---------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'BackupPilot Database Subnets'
+      SubnetIds: 
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  # Security group for Lambda functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for BackupPilot Lambda functions'
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  # Database security group - allows access ONLY from Lambda SG
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow BackupPilot Lambda and Control Plane access to Aurora'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------
+  # DATABASE & SECRETS
+  # ---------------------------------------------------------
+  AuroraSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'BackupPilotDBSecret-${AWS::StackName}'
+      Description: 'Aurora Database Master Password for BackupPilot'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "bpadmin"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: '15'
+      DBInstanceClass: db.t3.micro
+      DBName: backuppilot
+      MasterUsername: bpadmin
+      MasterUserPassword: 
+        !Join [ "", [ "{{resolve:secretsmanager:", !Ref AuroraSecret, ":SecretString:password}}" ] ]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: 
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: true
+      AllocatedStorage: '20'
+
+  # ---------------------------------------------------------
+  # SNS & EVENTBRIDGE
+  # ---------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-Alerts'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SchedulerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BackupWorkerLambda.Arn
+
+  # ---------------------------------------------------------
+  # LAMBDAS (INLINE CODE — NO S3 DEPENDENCY)
+  # ---------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: EC2AndSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:CreateVolume
+                  - ec2:AttachVolume
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AuroraSecret
+
+  BackupWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-BackupWorker'
+      Runtime: nodejs20.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          SECRET_ARN: !Ref AuroraSecret
+          AURORA_ENDPOINT: !GetAtt RDSInstance.Endpoint.Address
+      Code:
+        ZipFile: |
+          const { EC2Client, CreateSnapshotCommand, CreateTagsCommand, DescribeVolumesCommand } = require('@aws-sdk/client-ec2');
+          const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+          const { Client } = require('pg');
+
+          exports.handler = async (event) => {
+            console.log('BackupWorker invoked:', JSON.stringify(event));
+            const { policyId, userId, volumeId, targetName, policyName, region } = event;
+            const ec2 = new EC2Client({ region: region || process.env.AWS_REGION });
+            const sns = new SNSClient({ region: region || process.env.AWS_REGION });
+
+            let dbClient;
+            try {
+              // Resolve database credentials from Secrets Manager
+              const smClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
+              const secretRes = await smClient.send(new GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }));
+              const secret = JSON.parse(secretRes.SecretString);
+              const dbUrl = `postgresql://${secret.username}:${encodeURIComponent(secret.password)}@${process.env.AURORA_ENDPOINT}:5432/backuppilot`;
+              dbClient = new Client({ connectionString: dbUrl });
+              await dbClient.connect();
+
+              // Create backup job record
+              const jobRes = await dbClient.query(
+                `INSERT INTO backup_jobs (id, policy_id, started_at, status) VALUES (gen_random_uuid(), $1, NOW(), 'Running') RETURNING id`,
+                [policyId]
+              );
+              const jobId = jobRes.rows[0].id;
+
+              // Create EBS snapshot
+              const snapRes = await ec2.send(new CreateSnapshotCommand({
+                VolumeId: volumeId,
+                Description: `BackupPilot | Policy: ${policyName} | Job: ${jobId}`,
+              }));
+
+              const snapshotId = snapRes.SnapshotId;
+
+              // Tag the snapshot
+              await ec2.send(new CreateTagsCommand({
+                Resources: [snapshotId],
+                Tags: [
+                  { Key: 'BackupPilot:PolicyId', Value: policyId },
+                  { Key: 'BackupPilot:JobId', Value: jobId },
+                  { Key: 'Name', Value: `bp-${targetName}-${new Date().toISOString().split('T')[0]}` },
+                ],
+              }));
+
+              // Get volume size for metadata
+              const volRes = await ec2.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }));
+              const volumeSize = volRes.Volumes?.[0]?.Size || 0;
+
+              // Insert snapshot record
+              await dbClient.query(
+                `INSERT INTO snapshots (snapshot_id, job_id, size, state, created_at) VALUES ($1, $2, $3, 'completed', NOW())`,
+                [snapshotId, jobId, volumeSize]
+              );
+
+              // Mark job successful
+              await dbClient.query(
+                `UPDATE backup_jobs SET status = 'Success', completed_at = NOW() WHERE id = $1`,
+                [jobId]
+              );
+
+              // Audit log
+              await dbClient.query(
+                `INSERT INTO audit_logs (id, actor, action, entity_type, entity_id, details, created_at) VALUES (gen_random_uuid(), $1, 'BACKUP_COMPLETE', 'BackupJob', $2, $3, NOW())`,
+                [userId || 'system', jobId, JSON.stringify({ snapshotId, volumeId, policyName })]
+              );
+
+              // SNS notification
+              await sns.send(new PublishCommand({
+                TopicArn: process.env.SNS_TOPIC_ARN,
+                Subject: `BackupPilot: Backup Succeeded`,
+                Message: `Backup completed.\nPolicy: ${policyName}\nSnapshot: ${snapshotId}\nVolume: ${volumeId}`,
+              }));
+
+              return { statusCode: 200, body: JSON.stringify({ jobId, snapshotId }) };
+            } catch (err) {
+              console.error('Backup failed:', err);
+              // Attempt SNS failure notification
+              try {
+                await sns.send(new PublishCommand({
+                  TopicArn: process.env.SNS_TOPIC_ARN,
+                  Subject: `BackupPilot: Backup Failed`,
+                  Message: `Backup failed for policy ${policyName || policyId}.\nError: ${err.message}`,
+                }));
+              } catch (snsErr) { console.error('SNS notification failed:', snsErr); }
+              return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+            } finally {
+              if (dbClient) await dbClient.end().catch(() => {});
+            }
+          };
+
+  RestoreWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-RestoreWorker'
+      Runtime: nodejs20.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Timeout: 120
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          SECRET_ARN: !Ref AuroraSecret
+          AURORA_ENDPOINT: !GetAtt RDSInstance.Endpoint.Address
+      Code:
+        ZipFile: |
+          const { EC2Client, CreateVolumeCommand, DescribeSnapshotsCommand, CreateTagsCommand } = require('@aws-sdk/client-ec2');
+          const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+          const { Client } = require('pg');
+
+          exports.handler = async (event) => {
+            console.log('RestoreWorker invoked:', JSON.stringify(event));
+            const { restoreJobId, snapshotId, region, instanceId } = event;
+            const ec2 = new EC2Client({ region: region || process.env.AWS_REGION });
+            const sns = new SNSClient({ region: region || process.env.AWS_REGION });
+
+            let dbClient;
+            try {
+              // Resolve database credentials from Secrets Manager
+              const smClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
+              const secretRes = await smClient.send(new GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }));
+              const secret = JSON.parse(secretRes.SecretString);
+              const dbUrl = `postgresql://${secret.username}:${encodeURIComponent(secret.password)}@${process.env.AURORA_ENDPOINT}:5432/backuppilot`;
+              dbClient = new Client({ connectionString: dbUrl });
+              await dbClient.connect();
+
+              // Mark job as running
+              await dbClient.query(
+                `UPDATE restore_jobs SET status = 'Running' WHERE id = $1`,
+                [restoreJobId]
+              );
+
+              // Get snapshot details for AZ
+              const snapDesc = await ec2.send(new DescribeSnapshotsCommand({ SnapshotIds: [snapshotId] }));
+              const volumeSize = snapDesc.Snapshots?.[0]?.VolumeSize || 8;
+
+              // Create volume from snapshot
+              const volRes = await ec2.send(new CreateVolumeCommand({
+                SnapshotId: snapshotId,
+                AvailabilityZone: `${region || process.env.AWS_REGION}a`,
+                VolumeType: 'gp3',
+                Size: volumeSize,
+              }));
+
+              const newVolumeId = volRes.VolumeId;
+
+              // Tag the new volume
+              await ec2.send(new CreateTagsCommand({
+                Resources: [newVolumeId],
+                Tags: [
+                  { Key: 'BackupPilot:RestoredFrom', Value: snapshotId },
+                  { Key: 'BackupPilot:RestoreJobId', Value: restoreJobId },
+                  { Key: 'Name', Value: `bp-restore-${restoreJobId.substring(0, 8)}` },
+                ],
+              }));
+
+              // Mark job completed
+              await dbClient.query(
+                `UPDATE restore_jobs SET status = 'Completed', completed_at = NOW(), new_volume_id = $1 WHERE id = $2`,
+                [newVolumeId, restoreJobId]
+              );
+
+              // Audit log
+              await dbClient.query(
+                `INSERT INTO audit_logs (id, actor, action, entity_type, entity_id, details, created_at) VALUES (gen_random_uuid(), 'system', 'RESTORE_COMPLETE', 'RestoreJob', $1, $2, NOW())`,
+                [restoreJobId, JSON.stringify({ snapshotId, newVolumeId })]
+              );
+
+              // SNS notification
+              await sns.send(new PublishCommand({
+                TopicArn: process.env.SNS_TOPIC_ARN,
+                Subject: `BackupPilot: Restore Completed`,
+                Message: `Restore completed.\nSnapshot: ${snapshotId}\nNew Volume: ${newVolumeId}`,
+              }));
+
+              return { statusCode: 200, body: JSON.stringify({ restoreJobId, newVolumeId }) };
+            } catch (err) {
+              console.error('Restore failed:', err);
+              // Mark as failed in DB
+              try {
+                if (dbClient) {
+                  await dbClient.query(
+                    `UPDATE restore_jobs SET status = 'Failed', completed_at = NOW() WHERE id = $1`,
+                    [restoreJobId]
+                  );
+                }
+              } catch (dbErr) { console.error('DB update failed:', dbErr); }
+              // SNS failure notification
+              try {
+                await sns.send(new PublishCommand({
+                  TopicArn: process.env.SNS_TOPIC_ARN,
+                  Subject: `BackupPilot: Restore Failed`,
+                  Message: `Restore failed for job ${restoreJobId}.\nError: ${err.message}`,
+                }));
+              } catch (snsErr) { console.error('SNS notification failed:', snsErr); }
+              return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+            } finally {
+              if (dbClient) await dbClient.end().catch(() => {});
+            }
+          };
+
+  # ---------------------------------------------------------
+  # CROSS-ACCOUNT IAM ROLE FOR BACKUPPILOT
+  # ---------------------------------------------------------
+  BackupPilotCustomerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-BackupPilotRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${BackupPilotAccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BackupPilotAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AuroraSecret
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:CreateVolume
+                  - ec2:DescribeSnapshots
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: 
+                  - !GetAtt RestoreWorkerLambda.Arn
+                  - !GetAtt BackupWorkerLambda.Arn
+
+Outputs:
+  RoleArn:
+    Description: 'IAM Role ARN for BackupPilot to Assume'
+    Value: !GetAtt BackupPilotCustomerRole.Arn
+  SecretArn:
+    Description: 'Secrets Manager ARN for Aurora Credentials'
+    Value: !Ref AuroraSecret
+  AuroraEndpoint:
+    Description: 'Aurora Database Endpoint'
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  Region:
+    Description: 'Deployment Region'
+    Value: !Ref 'AWS::Region'
+  AccountId:
+    Description: 'Customer AWS Account ID'
+    Value: !Ref 'AWS::AccountId'
+  StackName:
+    Description: 'CloudFormation Stack Name'
+    Value: !Ref 'AWS::StackName'

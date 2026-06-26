@@ -1,0 +1,147 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("CUSTOMER_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/@prisma/customer-client"
+}
+
+enum Role {
+  User
+  Admin
+}
+
+enum PolicyStatus {
+  Active
+  Paused
+  Deleted
+}
+
+enum JobStatus {
+  Running
+  Success
+  Failed
+}
+
+enum RestoreStatus {
+  Pending
+  Running
+  Completed
+  Failed
+}
+
+enum NotificationStatus {
+  Sent
+  Read
+}
+
+model User {
+  id            String         @id @db.Uuid // Cognito "sub"
+  email         String         @unique
+  name          String
+  role          Role           @default(User)
+  created_at    DateTime       @default(now())
+  targets       BackupTarget[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+model BackupTarget {
+  id          String         @id @default(uuid()) @db.Uuid
+  user_id     String         @db.Uuid
+  user        User           @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  name        String
+  instance_id String
+  volume_id   String
+  region      String
+  created_at  DateTime       @default(now())
+  policies    BackupPolicy[]
+
+  @@index([user_id])
+  @@map("backup_targets")
+}
+
+model BackupPolicy {
+  id                         String         @id @default(uuid()) @db.Uuid
+  target_id                  String         @db.Uuid
+  target                     BackupTarget   @relation(fields: [target_id], references: [id], onDelete: Cascade)
+  name                       String
+  frequency                  String         // rate(1 day) or cron(...)
+  retention_days             Int
+  email_alerts               Boolean        @default(true)
+  status                     PolicyStatus   @default(Active)
+  eventbridge_schedule_name String
+  created_at                 DateTime       @default(now())
+  jobs                       BackupJob[]
+
+  @@index([target_id])
+  @@map("backup_policies")
+}
+
+model BackupJob {
+  id            String         @id @default(uuid()) @db.Uuid
+  policy_id     String         @db.Uuid
+  policy        BackupPolicy   @relation(fields: [policy_id], references: [id], onDelete: Cascade)
+  started_at    DateTime       @default(now())
+  completed_at  DateTime?
+  status        JobStatus      @default(Running)
+  error_message String?
+  snapshots     Snapshot[]
+
+  @@index([policy_id])
+  @@map("backup_jobs")
+}
+
+model Snapshot {
+  snapshot_id String       @id // e.g., snap-xxxxx
+  job_id      String       @db.Uuid
+  job         BackupJob    @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  size        Int          // Size in GB
+  state       String       // e.g., completed, pending
+  created_at  DateTime     @default(now())
+  restores    RestoreJob[]
+
+  @@index([job_id])
+  @@map("snapshots")
+}
+
+model RestoreJob {
+  id            String        @id @default(uuid()) @db.Uuid
+  snapshot_id   String
+  snapshot      Snapshot      @relation(fields: [snapshot_id], references: [snapshot_id], onDelete: Cascade)
+  status        RestoreStatus @default(Pending)
+  started_at    DateTime      @default(now())
+  completed_at  DateTime?
+  new_volume_id String?
+
+  @@index([snapshot_id])
+  @@map("restore_jobs")
+}
+
+model Notification {
+  id         String             @id @default(uuid()) @db.Uuid
+  user_id    String             @db.Uuid
+  user       User               @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  type       String             // e.g. BACKUP_SUCCESS, RESTORE_FAILED
+  message    String
+  status     NotificationStatus @default(Sent)
+  created_at DateTime           @default(now())
+
+  @@index([user_id])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actor       String   // user_id or system
+  action      String   // e.g. CREATE_TARGET, DELETE_POLICY
+  entity_type String   // e.g. BackupTarget, BackupPolicy
+  entity_id   String?
+  details     Json     // JSON audit details
+  created_at  DateTime @default(now())
+
+  @@map("audit_logs")
+}

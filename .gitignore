@@ -44,3 +44,6 @@ scratch_*.js
 
 # Zip backup
 AWSPROJECT(COPY).zip
+
+# Terraform
+terraform/.terraform/

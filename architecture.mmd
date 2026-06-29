@@ -1,0 +1,43 @@
+graph TD
+    %% Styling
+    classDef controlPlane fill:#f9f9f9,stroke:#333,stroke-width:2px;
+    classDef dataPlane fill:#e6f3ff,stroke:#0066cc,stroke-width:2px;
+    classDef awsService fill:#ff9900,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef db fill:#336791,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef nextjs fill:#000,stroke:#fff,stroke-width:2px,color:#fff;
+
+    %% Control Plane
+    subgraph Control Plane [Control Plane BackupPilot]
+        direction TB
+        NextJS[Next.js 14 App Router]:::nextjs
+        Cognito[Amazon Cognito Auth]:::awsService
+        ControlDB[(Aurora PostgreSQL<br/>Control Database)]:::db
+        
+        NextJS <-->|Verify JWT| Cognito
+        NextJS <-->|Lookup Connection| ControlDB
+    end
+
+    %% Cross-Account Boundary
+    NextJS -->|1. STS AssumeRole + ExternalId| CustomerRole
+    NextJS -->|2. Fetch Credentials| Secrets
+    NextJS -->|3. Connect Dynamic Prisma| CustomerDB
+
+    %% Data Plane
+    subgraph Data Plane [Data Plane Customer AWS Account]
+        direction TB
+        CustomerRole[BackupPilotCustomerRole]:::awsService
+        CustomerDB[(Aurora PostgreSQL<br/>Customer Data)]:::db
+        EventBridge[EventBridge Scheduler]:::awsService
+        Lambda[Lambda Workers<br/>Backup + Restore]:::awsService
+        SNS[SNS Alerts]:::awsService
+        Secrets[Secrets Manager]:::awsService
+        EC2[EC2 / EBS<br/>Protected Resources]:::awsService
+
+        CustomerRole -.->|Provides Access to| Secrets
+        CustomerRole -.->|Provides Access to| CustomerDB
+        
+        EventBridge -->|Triggers on Schedule| Lambda
+        Lambda -->|Create/Restore| EC2
+        Lambda -->|Read/Write Metadata| CustomerDB
+        Lambda -->|Publish Notifications| SNS
+    end

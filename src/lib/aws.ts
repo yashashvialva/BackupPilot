@@ -2,7 +2,7 @@ import { DescribeInstancesCommand, DescribeVolumesCommand, CreateSnapshotCommand
 import { CreateScheduleCommand, UpdateScheduleCommand, DeleteScheduleCommand } from "@aws-sdk/client-scheduler";
 import { PublishCommand } from "@aws-sdk/client-sns";
 import { InvokeCommand } from "@aws-sdk/client-lambda";
-import { PrismaClient as CustomerPrismaClient } from "@prisma/customer-client";
+import { PrismaClient as CustomerPrismaClient } from "../../prisma/generated/customer-client";
 
 const mockMode = process.env.MOCK_AWS === "true";
 

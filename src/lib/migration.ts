@@ -2,7 +2,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { getTenantCredentialsAndDbUrl } from "./tenant";
 import { prisma as controlPlaneDb } from "./db";
-import { PrismaClient as CustomerPrismaClient } from "@prisma/customer-client";
+import { PrismaClient as CustomerPrismaClient } from "../../prisma/generated/customer-client";
 
 const execAsync = promisify(exec);
 

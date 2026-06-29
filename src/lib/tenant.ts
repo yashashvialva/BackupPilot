@@ -1,4 +1,4 @@
-import { PrismaClient as CustomerPrismaClient } from "@prisma/customer-client";
+import { PrismaClient as CustomerPrismaClient } from "../../prisma/generated/customer-client";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { EC2Client } from "@aws-sdk/client-ec2";
